@@ -476,6 +476,7 @@ def process_single_sample(sample, args, sampling_params, rollout_idx=None):
                 "accuracy_score": final_result["accuracy_score"],
                 "trajectory_score": final_result.get("trajectory_score"),
                 "trajectory_analysis": final_result.get("trajectory_analysis"),
+                "result": final_result,
             }
             with open(os.path.join(save_dir, 'metrics.json'), 'w', encoding='utf-8') as f:
                 json.dump(metrics, f, indent=4)

@@ -7,6 +7,7 @@ import re
 import json
 import logging
 import copy
+import shutil
 from typing import Dict, List, Optional, Any, Callable
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from exskill import ExperienceLLM, ExperienceRetriever, load_experiences, format_for_prompt, rewrite_experiences_for_task, adapt_skill_for_task
@@ -468,7 +469,7 @@ def compute_and_save_sample_summary(question_id, sample_rollout_results, rollout
     Returns:
         dict: Sample summary dictionary
     """
-    if not sample_rollout_results:
+    if len(sample_rollout_results) != rollouts_per_sample:
         return None
     
     # Sort results by rollout_idx to ensure correct order (parallel execution may complete in any order)
@@ -483,6 +484,7 @@ def compute_and_save_sample_summary(question_id, sample_rollout_results, rollout
         "question_id": question_id,
         "num_rollouts": len(sorted_results),
         "accuracies": accuracies,
+        "completed": True,
     }
 
     # Compute pass@k and average@k for each k
@@ -491,9 +493,11 @@ def compute_and_save_sample_summary(question_id, sample_rollout_results, rollout
         sample_summary[f"pass@{k}"] = 1.0 if any(acc == 1.0 for acc in acc_at_k) else 0.0
         sample_summary[f"average@{k}"] = sum(acc_at_k) / k
 
-    # Save to file
-    with open(os.path.join(sample_dir, SAMPLE_SUMMARY_FILENAME), 'w', encoding='utf-8') as f:
+    # Publish completion only after every rollout result has been saved.
+    summary_path = os.path.join(sample_dir, SAMPLE_SUMMARY_FILENAME)
+    with open(summary_path + ".tmp", "w", encoding="utf-8") as f:
         json.dump(sample_summary, f, indent=4, ensure_ascii=False)
+    os.replace(summary_path + ".tmp", summary_path)
     
     print(f"  \nSample {question_id}: pass@{rollouts_per_sample}={sample_summary[f'pass@{rollouts_per_sample}']:.2f}, "
           f"average@{rollouts_per_sample}={sample_summary[f'average@{rollouts_per_sample}']:.4f}")
@@ -502,88 +506,42 @@ def compute_and_save_sample_summary(question_id, sample_rollout_results, rollout
 
 
 def check_sample_completed(sample_dir, args):
-    """
-    Check if a sample is already completed (has traj.jsonl with turn_idx and metrics.json).
-    
-    Args:
-        sample_dir: Sample directory path
-        args: Command line arguments
-        
-    Returns:
-        dict or None: Sample info dict if completed, None otherwise
-    """
-    if not getattr(args, 'skip_completed', False):
+    """Load a completed question, including failed but finished rollouts."""
+    if not args.skip_completed:
         return None
-    
-    traj_file = os.path.join(sample_dir, 'traj.jsonl')
-    metrics_file = os.path.join(sample_dir, 'metrics.json')
-    
-    # Check if completed: traj.jsonl exists with turn_idx, and metrics.json exists
-    is_complete = False
-    if os.path.exists(traj_file) and os.path.exists(metrics_file):
-        try:
-            with open(traj_file, 'r', encoding='utf-8') as f:
-                lines = [l for l in f if l.strip()]
-                # Check if there are any turn_idx entries
-                for line in lines:
-                    try:
-                        traj_data = json.loads(line)
-                        if 'turn_idx' in traj_data and traj_data['turn_idx'] is not None:
-                            is_complete = True
-                            break
-                    except (json.JSONDecodeError, KeyError) as e:
-                        logger.debug(f"Error parsing trajectory line: {e}")
-                        pass
-        except Exception as e:
-            logger.debug(f"Error reading trajectory file: {e}")
-            pass
-    
-    if not is_complete:
+
+    summary_path = os.path.join(sample_dir, SAMPLE_SUMMARY_FILENAME)
+    if not os.path.exists(summary_path):
         return None
-    
-    # Try to load existing result
-    sample_rollout_results = []
-    try:
-        with open(metrics_file, 'r', encoding='utf-8') as f:
+    with open(summary_path, encoding="utf-8") as f:
+        summary = json.load(f)
+    if not summary.get("completed") or summary["num_rollouts"] != args.rollouts_per_sample:
+        return None
+
+    results = []
+    for rollout_idx in range(args.rollouts_per_sample):
+        rollout_dir = (
+            os.path.join(sample_dir, f"rollout_{rollout_idx}")
+            if args.rollouts_per_sample > 1 else sample_dir
+        )
+        metrics_path = os.path.join(rollout_dir, "metrics.json")
+        if not os.path.isfile(os.path.join(rollout_dir, "traj.jsonl")) or not os.path.isfile(metrics_path):
+            return None
+        with open(metrics_path, encoding="utf-8") as f:
             metrics = json.load(f)
-        
-        # Read turns from traj.jsonl to get accurate turn count
-        num_turns = 0
-        try:
-            with open(traj_file, 'r', encoding='utf-8') as f:
-                max_turn_idx = -1
-                for line in f:
-                    if line.strip():
-                        try:
-                            traj_data = json.loads(line)
-                            turn_idx = traj_data.get('turn_idx')
-                            if turn_idx is not None and turn_idx > max_turn_idx:
-                                max_turn_idx = turn_idx
-                        except (json.JSONDecodeError, KeyError) as e:
-                            logger.debug(f"Error parsing trajectory line: {e}")
-                            pass
-            num_turns = max_turn_idx + 1 if max_turn_idx >= 0 else 0
-        except Exception as e:
-            logger.debug(f"Error reading trajectory file for turn count: {e}")
-            pass
-        
-        # Create a conversation_history with the correct number of assistant turns
-        # This ensures accurate turn statistics
-        conversation_history = [{"role": "assistant", "content": ""} for _ in range(num_turns)] if num_turns > 0 else []
-        
-        # Create result dict with accurate turn information
-        sample_rollout_results.append({
-            'question_id': os.path.basename(sample_dir),
-            'accuracy_score': metrics.get('accuracy_score', 0.0),
-            'conversation_history': conversation_history,
-        })
-    except Exception as e:
-        logger.debug(f"Error loading existing metrics: {e}")
-        pass
-    
-    return {
-        'sample_rollout_results': sample_rollout_results
-    }
+        if "result" not in metrics:
+            return None
+        result = metrics["result"]
+        result["_rollout_idx"] = rollout_idx
+        results.append(result)
+    return {"sample_rollout_results": results}
+
+
+def prepare_sample_directory(sample_dir, args):
+    """Discard an interrupted question before restarting all its rollouts."""
+    if args.skip_completed and os.path.isdir(sample_dir):
+        shutil.rmtree(sample_dir)
+    os.makedirs(sample_dir, exist_ok=True)
 
 
 def prepare_sample_args(args):
@@ -773,6 +731,14 @@ def execute_pipeline_parallel_processing(
             question_id = sample_results_dict[actual_sample_idx]['question_id']
             sample_dir = sample_results_dict[actual_sample_idx]['sample_dir']
             sample_args = prepare_sample_args(args)
+            completed_info = check_sample_completed(sample_dir, sample_args)
+            if completed_info:
+                results = completed_info["sample_rollout_results"]
+                sample_results_dict[actual_sample_idx]["results"] = results
+                if all_results_list is not None:
+                    all_results_list.extend(results)
+                continue
+            prepare_sample_directory(sample_dir, sample_args)
             pending_retrieval_samples.append({
                 'sample_idx': actual_sample_idx,
                 'sample': sample,
@@ -782,7 +748,7 @@ def execute_pipeline_parallel_processing(
             })
 
         # Progress tracking
-        total_rollouts = len(samples) * args.rollouts_per_sample
+        total_rollouts = len(pending_retrieval_samples) * args.rollouts_per_sample
         pbar = tqdm(total=total_rollouts, desc=progress_desc or "Processing rollouts")
         
         rollout_counts = {}  # track completed rollouts per sample

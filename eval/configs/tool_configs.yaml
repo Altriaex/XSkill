@@ -3,13 +3,11 @@
 
 # CodeInterpreter configuration
 code_interpreter:
-  work_dir: "/tmp/code_interpreter"
   output_timeout: 30
 
   
 # Zoom configuration
 zoom:
-  work_dir: "/tmp/zoom"
   output_timeout: 30
 
 

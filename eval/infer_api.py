@@ -4,6 +4,8 @@ import argparse
 import os
 import json
 import threading
+import tempfile
+import shutil
 import time
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -36,7 +38,7 @@ from infer_api_utils import (
     retrieve_experiences_for_sample,
     compute_and_save_sample_summary,
     check_sample_completed,
-    reload_experiences,
+    prepare_sample_directory,
     prepare_sample_args,
     get_sample_metadata,
     compute_dataset_summary,
@@ -226,7 +228,7 @@ def generate_experience_for_sample(sample_info, args):
     return result
 
 
-def save_knowledge_snapshot(args, batch_idx):
+def save_knowledge_snapshot(args, batch_idx, question_ids):
     """
     Save a snapshot of current experience library and skill document before batch processing.
     
@@ -234,15 +236,27 @@ def save_knowledge_snapshot(args, batch_idx):
         args: Command line arguments
         batch_idx: Current batch index (0-based)
     """
-    import shutil
     from datetime import datetime
     
     snapshot_dir = os.path.join(args.output_dir, "snapshots", f"batch_{batch_idx:03d}")
     os.makedirs(snapshot_dir, exist_ok=True)
     
+    metadata_path = os.path.join(snapshot_dir, "metadata.json")
+    if args.skip_completed and os.path.exists(metadata_path):
+        with open(metadata_path, encoding="utf-8") as f:
+            return json.load(f)
+
     metadata = {
         "batch_idx": batch_idx,
         "timestamp": datetime.now().isoformat(),
+        "question_ids": question_ids,
+        "completed": False,
+        "experience_library_exists": bool(
+            args.experience_library and os.path.isfile(args.experience_library)
+        ),
+        "skill_library_exists": bool(
+            args.skill_library and os.path.isfile(args.skill_library)
+        ),
     }
     
     # Snapshot experience library: copy if source exists, then count from snapshot file
@@ -280,10 +294,12 @@ def save_knowledge_snapshot(args, batch_idx):
         metadata["skill_word_count"] = 0
     
     # Save metadata
-    with open(os.path.join(snapshot_dir, "metadata.json"), 'w', encoding='utf-8') as f:
+    with open(metadata_path + ".tmp", "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
+    os.replace(metadata_path + ".tmp", metadata_path)
     
     print(f"  [Snapshot] Saved batch_{batch_idx:03d} snapshot (exp: {metadata['experience_count']}, skill: {metadata['skill_word_count']} words)")
+    return metadata
 
 
 def process_large_batch_experiences(samples_info, args, batch_idx=0, is_final=False):
@@ -306,7 +322,10 @@ def process_large_batch_experiences(samples_info, args, batch_idx=0, is_final=Fa
     print(f"\n[Large Batch {batch_idx}] Processing experience generation for {len(samples_info)} samples...")
     
     # Save snapshot before processing
-    save_knowledge_snapshot(args, batch_idx)
+    metadata = save_knowledge_snapshot(
+        args, batch_idx, [sample["question_id"] for sample in samples_info]
+    )
+    metadata["errors"] = []
     
     # Parallel experience and skill generation for all samples in the large batch
     all_experience_ops = []
@@ -331,8 +350,16 @@ def process_large_batch_experiences(samples_info, args, batch_idx=0, is_final=Fa
                         all_skill_contents.append(result['skill_content'])
                     successful_samples += 1
                 else:
+                    metadata["errors"].append({
+                        "stage": "generation", "question_id": result["sample_id"],
+                        "error": result.get("error"),
+                    })
                     print(f"  Warning: Generation failed for {result['sample_id']}: {result.get('error', 'Unknown error')}")
             except Exception as e:
+                metadata["errors"].append({
+                    "stage": "generation", "question_id": sample_info["question_id"],
+                    "error": str(e),
+                })
                 print(f"  Warning: Generation failed for {sample_info['question_id']}: {e}")
     
     gen_time = time.time() - gen_start
@@ -368,6 +395,7 @@ def process_large_batch_experiences(samples_info, args, batch_idx=0, is_final=Fa
                 print(f"  [Large Batch] Merged {len(all_experience_ops)} experience operations into library (final size: {len(merged)})")
                 print(f"  [Timing] Experience merge: {merge_time:.1f}s")
         except Exception as e:
+            metadata["errors"].append({"stage": "experience_update", "error": str(e)})
             print(f"  Warning: Failed to merge experiences into library: {e}")
             
     # Merge all skills into library (single merge operation)
@@ -406,8 +434,19 @@ def process_large_batch_experiences(samples_info, args, batch_idx=0, is_final=Fa
                 print(f"  [Large Batch] Merged {len(all_skill_contents)} skills into library")
                 print(f"  [Timing] Skill merge: {merge_time:.1f}s")
         except Exception as e:
+            metadata["errors"].append({"stage": "skill_update", "error": str(e)})
             print(f"  Warning: Failed to merge skills into library: {e}")
     
+    # Handled failures are terminal outcomes; only interruption requires replay.
+    metadata["completed"] = True
+    metadata["successful_samples"] = successful_samples
+    metadata_path = os.path.join(
+        args.output_dir, "snapshots", f"batch_{batch_idx:03d}", "metadata.json"
+    )
+    with open(metadata_path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+    os.replace(metadata_path + ".tmp", metadata_path)
+
     total_time = time.time() - start_time
     print(f"[Large Batch] Completed: {successful_samples}/{len(samples_info)} samples processed successfully (total: {total_time:.1f}s)")
     return successful_samples
@@ -417,6 +456,12 @@ def main(args):
     """
     Main function to run the API-based inference process.
     """
+    # Keep temporary files and child processes inside this experiment.
+    tmp_dir = os.path.join(os.path.abspath(args.output_dir), "tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    os.environ["TMPDIR"] = tmp_dir
+    tempfile.tempdir = tmp_dir
+
     # Read model configurations from environment variables (required)
     args.model_name = os.environ.get("REASONING_MODEL_NAME")
     if not args.model_name:
@@ -486,6 +531,12 @@ def main(args):
         print(f"Error loading tool configs: {e}")
         args.tool_configs = {}
 
+    # Resolve tool directories before output_dir changes for individual rollouts.
+    for tool_name in ("code_interpreter", "zoom"):
+        args.tool_configs.setdefault(tool_name, {})["work_dir"] = os.path.join(
+            os.path.abspath(args.output_dir), tool_name
+        )
+
     # Load data
     if args.input_file.endswith('.jsonl'):
         with open(args.input_file, 'r', encoding='utf-8') as f:
@@ -509,33 +560,14 @@ def main(args):
         "max_tokens": args.max_completion_tokens,  # Configurable (default: 16384)
     }
 
-    # Prepare experience injection
-    experience_retriever, experience_injection_text = initialize_experience_retriever(args)
-    if experience_injection_text:
-        # Traditional mode: inject all experiences (or up to max_items)
-        SYSTEM_PROMPT = (experience_injection_text + "\n\n" + BASE_SYSTEM_PROMPT) if BASE_SYSTEM_PROMPT else experience_injection_text
-        set_processors_prompts(SYSTEM_PROMPT)
-
     all_results = []
-    
-    # Large batch management for experience generation
-    large_batch_queue = []  # Accumulate samples for large batch processing
-    large_batch_idx = 0  # Counter for batch snapshots
-    use_experience_batching = getattr(args, 'experience_online_generate', False)
-    
+    use_experience_batching = getattr(args, "experience_online_generate", False)
+
     def process_single_sample_with_experience(sample, sample_idx):
         """Process a single sample including experience generation."""
         sample_args = prepare_sample_args(args)
         
         question_id, sample_dir = get_sample_metadata(sample, sample_idx, sample_args.output_dir)
-        os.makedirs(sample_dir, exist_ok=True)
-        
-        retrieve_experiences_for_sample(
-            sample, sample_args, experience_retriever, BASE_SYSTEM_PROMPT,
-            question_id, sample_dir,
-            update_global_prompts=True
-        )
-        
         # Check if sample is already completed (skip if --skip-completed is set)
         completed_info = check_sample_completed(sample_dir, sample_args)
         if completed_info:
@@ -548,6 +580,12 @@ def main(args):
                 'sample_rollout_results': completed_info.get('sample_rollout_results', [])
             }
         
+        prepare_sample_directory(sample_dir, sample_args)
+        retrieve_experiences_for_sample(
+            sample, sample_args, experience_retriever, BASE_SYSTEM_PROMPT,
+            question_id, sample_dir, update_global_prompts=True
+        )
+
         sample_rollout_results = []
         
         if sample_args.rollouts_per_sample > 1:
@@ -567,16 +605,16 @@ def main(args):
                         result['_rollout_idx'] = rollout_idx
                         sample_rollout_results.append(result)
             
-            # Save sample-level pass@k metrics
-            compute_and_save_sample_summary(
-                question_id, sample_rollout_results, sample_args.rollouts_per_sample, sample_dir
-            )
         
         else:
             result = process_single_sample(sample, sample_args, sampling_params, rollout_idx=None)
             if result:
                 sample_rollout_results.append(result)
         
+        compute_and_save_sample_summary(
+            question_id, sample_rollout_results, sample_args.rollouts_per_sample, sample_dir
+        )
+
         # Return sample info for batch experience generation
         # Experience generation is handled at large batch level
         return {
@@ -587,197 +625,100 @@ def main(args):
             'sample_rollout_results': sample_rollout_results
         }
     
-    if args.num_workers > 1 and args.rollouts_per_sample > 1:
-        print(f"\n[Parallel Mode] Processing {len(data)} samples with {args.num_workers} workers...")
-        print(f"  Rollouts per sample: {args.rollouts_per_sample}")
-        
-        if use_experience_batching:
-            max_concurrent_samples = args.num_workers // args.rollouts_per_sample
-            print(f"  Max concurrent samples per batch: {max_concurrent_samples} (limited by {args.num_workers} workers)")
-            
-            # Process samples in batches
-            sample_idx = 0
-            while sample_idx < len(data):
-                # Determine batch size: either max_concurrent_samples or remaining samples
-                batch_size = min(max_concurrent_samples, len(data) - sample_idx)
-                batch_samples = data[sample_idx:sample_idx + batch_size]
-                batch_indices = list(range(sample_idx, sample_idx + batch_size))
-                
-                print(f"\n[Batch] Processing samples {sample_idx + 1}-{sample_idx + batch_size} ({batch_size} samples)...")
-                
-                batch_sample_results = {}
-                for local_idx, sample in enumerate(batch_samples):
-                    actual_sample_idx = batch_indices[local_idx]
-                    question_id, sample_dir = get_sample_metadata(sample, actual_sample_idx, args.output_dir)
-                    
-                    batch_sample_results[actual_sample_idx] = {
-                        'results': [],
-                        'sample': sample,
-                        'question_id': question_id,
-                        'sample_dir': sample_dir
-                    }
-                
-                # Execute pipeline parallel processing
-                execute_pipeline_parallel_processing(
-                    samples=batch_samples,
-                    sample_indices=batch_indices,
-                    sample_results_dict=batch_sample_results,
-                    args=args,
-                    experience_retriever=experience_retriever,
-                    base_system_prompt=BASE_SYSTEM_PROMPT,
-                    sampling_params=sampling_params,
-                    run_single_rollout_func=run_single_rollout,
-                    progress_desc=f"Batch {sample_idx // batch_size + 1}",
-                    all_results_list=all_results
-                )
-                
-                batch_sample_infos = []
-                for actual_sample_idx in batch_indices:
-                    if actual_sample_idx in batch_sample_results:
-                        sample_info = batch_sample_results[actual_sample_idx]
-                        sample_info_dict = {
-                            'sample': sample_info['sample'],
-                            'sample_idx': actual_sample_idx,
-                            'question_id': sample_info['question_id'],
-                            'sample_dir': sample_info['sample_dir'],
-                            'sample_rollout_results': sample_info['results']
-                        }
-                        batch_sample_infos.append(sample_info_dict)
-                
-                # Accumulate for large batch experience generation
-                large_batch_queue.extend(batch_sample_infos)
-                
-                # Check if we've reached a large batch
-                if len(large_batch_queue) >= args.experience_samples_per_large_batch:
-                    print(f"\n[Large Batch] Triggering experience generation for {len(large_batch_queue)} samples...")
-                    process_large_batch_experiences(large_batch_queue, args, batch_idx=large_batch_idx)
-                    large_batch_idx += 1
-                    large_batch_queue.clear()
-                    SYSTEM_PROMPT = reload_experiences(args, BASE_SYSTEM_PROMPT, experience_retriever)
-                sample_idx += batch_size
-        else:
-            # No-batch mode: submit all rollouts at once for maximum worker utilization
-            total_rollouts = len(data) * args.rollouts_per_sample
-            print(f"  Total rollouts: {total_rollouts} (no batch limit)")
-            
-            # Track results by sample
-            sample_results = {}  # sample_idx -> {'results': [], 'sample': sample, 'question_id': str, 'sample_dir': str}
-            
-            # Prepare sample metadata
-            for sample_idx, sample in enumerate(data):
-                question_id, sample_dir = get_sample_metadata(sample, sample_idx, args.output_dir)
-                
-                sample_results[sample_idx] = {
-                    'results': [],
-                    'sample': sample,
-                    'question_id': question_id,
-                    'sample_dir': sample_dir
+    batch_size = (
+        args.experience_samples_per_large_batch
+        if use_experience_batching else max(len(data), 1)
+    )
+    for batch_idx, start in enumerate(range(0, len(data), batch_size)):
+        batch_samples = data[start:start + batch_size]
+        batch_indices = list(range(start, start + len(batch_samples)))
+        question_ids = [
+            get_sample_metadata(sample, idx, args.output_dir)[0]
+            for sample, idx in zip(batch_samples, batch_indices)
+        ]
+
+        # Restore interrupted updates before retrieving for unfinished questions.
+        metadata_path = os.path.join(
+            args.output_dir, "snapshots", f"batch_{batch_idx:03d}", "metadata.json"
+        )
+        if use_experience_batching and args.skip_completed and os.path.exists(metadata_path):
+            with open(metadata_path, encoding="utf-8") as f:
+                metadata = json.load(f)
+            if metadata.get("question_ids") != question_ids:
+                raise ValueError(f"Batch {batch_idx} has no matching recovery metadata")
+            if metadata["completed"]:
+                for sample, idx in zip(batch_samples, batch_indices):
+                    _, sample_dir = get_sample_metadata(sample, idx, args.output_dir)
+                    completed_info = check_sample_completed(sample_dir, args)
+                    if completed_info is None:
+                        raise ValueError(
+                            f"Completed batch {batch_idx} is missing question results: {sample_dir}"
+                        )
+                    all_results.extend(completed_info["sample_rollout_results"])
+                continue
+            for key, filename in (
+                ("experience_library", "experiences.json"),
+                ("skill_library", "SKILL.md"),
+            ):
+                library_path = getattr(args, key)
+                if metadata[key + "_exists"]:
+                    shutil.copy2(os.path.join(os.path.dirname(metadata_path), filename), library_path)
+                elif library_path and os.path.exists(library_path):
+                    os.remove(library_path)
+
+        experience_retriever, experience_injection_text = initialize_experience_retriever(args)
+        SYSTEM_PROMPT = (
+            experience_injection_text + "\n\n" + BASE_SYSTEM_PROMPT
+            if experience_injection_text else BASE_SYSTEM_PROMPT
+        )
+        set_processors_prompts(SYSTEM_PROMPT)
+
+        if args.num_workers > 1:
+            sample_results = {}
+            for sample, idx in zip(batch_samples, batch_indices):
+                question_id, sample_dir = get_sample_metadata(sample, idx, args.output_dir)
+                sample_results[idx] = {
+                    "results": [], "sample": sample,
+                    "question_id": question_id, "sample_dir": sample_dir,
                 }
-            
             execute_pipeline_parallel_processing(
-                samples=data,
-                sample_indices=list(range(len(data))),
-                sample_results_dict=sample_results,
-                args=args,
+                samples=batch_samples, sample_indices=batch_indices,
+                sample_results_dict=sample_results, args=args,
                 experience_retriever=experience_retriever,
                 base_system_prompt=BASE_SYSTEM_PROMPT,
                 sampling_params=sampling_params,
                 run_single_rollout_func=run_single_rollout,
-                progress_desc="Processing rollouts",
-                all_results_list=all_results
+                progress_desc=f"Batch {batch_idx}",
             )
-    
-    elif args.num_workers > 1:
-        print(f"\n[Parallel Mode] Processing {len(data)} samples with {args.num_workers} workers...")
-        
-        if use_experience_batching:
-            # When experience batching is enabled, process in batches to ensure proper experience learning flow
-            # Each sample uses 1 worker, so max concurrent samples = num_workers
-            max_concurrent_samples = args.num_workers
-            # But we want to process in large batch sizes for experience generation
-            batch_size = min(args.experience_samples_per_large_batch, max_concurrent_samples)
-            
-            sample_idx = 0
-            while sample_idx < len(data):
-                # Determine actual batch size
-                actual_batch_size = min(batch_size, len(data) - sample_idx)
-                batch_samples = data[sample_idx:sample_idx + actual_batch_size]
-                batch_indices = list(range(sample_idx, sample_idx + actual_batch_size))
-                
-                print(f"\n[Batch] Processing samples {sample_idx + 1}-{sample_idx + actual_batch_size} ({actual_batch_size} samples)...")
-                with ThreadPoolExecutor(max_workers=args.num_workers) as executor:
-                    futures = {
-                        executor.submit(process_single_sample_with_experience, sample, actual_idx): actual_idx
-                        for local_idx, (actual_idx, sample) in enumerate(zip(batch_indices, batch_samples))
-                    }
-                    
-                    # Collect results as they complete - wait for ALL samples in this batch
-                    batch_sample_infos = []
-                    for future in tqdm(as_completed(futures), total=len(futures), desc=f"Batch {sample_idx // batch_size + 1}"):
-                        actual_idx = futures[future]
-                        try:
-                            sample_info = future.result()
-                            if sample_info and sample_info.get('sample_rollout_results'):
-                                all_results.extend(sample_info['sample_rollout_results'])
-                                batch_sample_infos.append(sample_info)
-                        except Exception as e:
-                            print(f"  Error processing sample {actual_idx}: {e}")
-                
-                if use_experience_batching and batch_sample_infos:
-                    large_batch_queue.extend(batch_sample_infos)
-                    
-                    # Check if we've reached a large batch
-                    if len(large_batch_queue) >= args.experience_samples_per_large_batch:
-                        print(f"\n[Large Batch] Triggering experience generation for {len(large_batch_queue)} samples...")
-                        process_large_batch_experiences(large_batch_queue, args, batch_idx=large_batch_idx)
-                        large_batch_idx += 1
-                        large_batch_queue.clear()
-                        SYSTEM_PROMPT = reload_experiences(args, BASE_SYSTEM_PROMPT, experience_retriever)
-                sample_idx += actual_batch_size
-            if use_experience_batching and large_batch_queue:
-                print(f"\n[Final Batch] Processing remaining {len(large_batch_queue)} samples...")
-                process_large_batch_experiences(large_batch_queue, args, batch_idx=large_batch_idx, is_final=True)
-                large_batch_idx += 1
-                large_batch_queue.clear()
-        else:
-            # When experience batching is disabled, process all samples in parallel for maximum efficiency
-            with ThreadPoolExecutor(max_workers=args.num_workers) as executor:
-                # Submit all samples for parallel processing
-                futures = {
-                    executor.submit(process_single_sample_with_experience, sample, sample_idx): sample_idx
-                    for sample_idx, sample in enumerate(data)
+            batch_infos = [
+                {
+                    "sample": info["sample"], "sample_idx": idx,
+                    "question_id": info["question_id"], "sample_dir": info["sample_dir"],
+                    "sample_rollout_results": info["results"],
                 }
-                
-                for future in tqdm(as_completed(futures), total=len(data), desc="Processing samples"):
-                    sample_idx = futures[future]
-                    try:
-                        sample_info = future.result()
-                        if sample_info and sample_info.get('sample_rollout_results'):
-                            all_results.extend(sample_info['sample_rollout_results'])
-                    except Exception as e:
-                        print(f"  Error processing sample {sample_idx}: {e}")
-    
-    else:
-        # Sequential mode (single worker)
-        for sample_idx, sample in enumerate(tqdm(data, desc="Processing samples")):
-            sample_info = process_single_sample_with_experience(sample, sample_idx)
-            if sample_info and sample_info.get('sample_rollout_results'):
-                all_results.extend(sample_info['sample_rollout_results'])
-                if use_experience_batching:
-                    large_batch_queue.append(sample_info)
-                    if len(large_batch_queue) >= args.experience_samples_per_large_batch:
-                        process_large_batch_experiences(large_batch_queue, args, batch_idx=large_batch_idx)
-                        large_batch_idx += 1
-                        large_batch_queue.clear()
-                        # Reload experiences for next batch if experience injection is enabled
-                        SYSTEM_PROMPT = reload_experiences(args, BASE_SYSTEM_PROMPT, experience_retriever)
-    
-    # Process remaining samples in the queue (if any)
-    if use_experience_batching and large_batch_queue:
-        print(f"\n[Final Batch] Processing remaining {len(large_batch_queue)} samples...")
-        process_large_batch_experiences(large_batch_queue, args, batch_idx=large_batch_idx, is_final=True)
-        large_batch_idx += 1
-        large_batch_queue.clear()
+                for idx, info in sample_results.items()
+            ]
+        else:
+            batch_infos = [
+                process_single_sample_with_experience(sample, idx)
+                for sample, idx in zip(batch_samples, batch_indices)
+            ]
+
+        for info in batch_infos:
+            all_results.extend(sorted(
+                info["sample_rollout_results"], key=lambda result: result.get("_rollout_idx", 0)
+            ))
+        if use_experience_batching:
+            for info in batch_infos:
+                if len(info["sample_rollout_results"]) != args.rollouts_per_sample:
+                    raise RuntimeError(f"Question has unfinished rollouts: {info['question_id']}")
+            # A run limit does not turn an unfinished batch into a dataset tail.
+            if len(batch_samples) < batch_size and len(data) < original_count:
+                continue
+            process_large_batch_experiences(
+                batch_infos, args, batch_idx=batch_idx,
+                is_final=len(batch_samples) < batch_size,
+            )
 
     save_results(all_results, args.output_dir)
     print_summary(all_results, args.output_dir)
@@ -795,8 +736,8 @@ if __name__ == "__main__":
     parser.add_argument("--input-file", type=str, required=True, help="Path to the input data file.")
     parser.add_argument("--image-folder", type=str, required=True, help="Path to the folder containing images.")
     parser.add_argument("--output-dir", type=str, required=True, help="Directory to save the output results.")
-    parser.add_argument("--skip-completed", action='store_true', 
-                       help="Skip samples that are already completed (have traj.jsonl with turn_idx and metrics.json).")
+    parser.add_argument("--skip-completed", action='store_true', default=True,
+                       help="Resume finished questions and processed knowledge batches by default, including recorded failures.")
     parser.add_argument("--max-samples", type=int, default=None,
                        help="Maximum number of samples to process (default: None, process all samples).")
     
