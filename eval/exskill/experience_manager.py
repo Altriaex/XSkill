@@ -214,6 +214,8 @@ def _llm_merge_experiences(
             if attempt < max_retries - 1:
                 print(f"  - Warning: Merge LLM call failed (attempt {attempt+1}/{max_retries}): {e}")
             else:
+                if isinstance(e, ConnectionError):
+                    raise
                 print(f"  - Error: Merge LLM call failed after {max_retries} attempts: {e}")
                 return None
     
@@ -328,6 +330,8 @@ def batch_merge(
                 print(f"  - Library reduced to limit: {len(capped)} (<= {experience_limit})")
                 return capped
             except Exception as e:
+                if isinstance(e, ConnectionError):
+                    raise
                 print(f"  - Warning: failed to reduce existing library to limit {experience_limit}: {e}")
         return existing
     
@@ -398,6 +402,8 @@ def batch_merge(
             else:
                 print(f"  - Warning: reduction failed, library size unchanged: {len(final_experiences)} (limit {experience_limit})")
         except Exception as e:
+            if isinstance(e, ConnectionError):
+                raise
             print(f"  - Warning: failed to reduce experiences to limit {experience_limit}: {e}")
     
     return final_experiences
@@ -500,6 +506,8 @@ def _reduce_experiences_to_limit(
                     else:
                         print(f"      - Warning: Failed to generate merged text for {exp_id1} and {exp_id2}")
                 except Exception as e:
+                    if isinstance(e, ConnectionError):
+                        raise
                     print(f"      - Warning: Failed to merge {exp_id1} and {exp_id2}: {e}")
                     continue
             
@@ -513,6 +521,8 @@ def _reduce_experiences_to_limit(
             provider = ExperienceMemoryProvider(current, retriever=retriever)
             
         except Exception as e:
+            if isinstance(e, ConnectionError):
+                raise
             print(f"    - Round {round_idx}: Error during reduction: {e}")
             import traceback
             traceback.print_exc()
@@ -579,6 +589,8 @@ def refine_experience_library(
                 print(f"  [Refine] LLM call failed (attempt {attempt+1}/{max_retries}): {e}")
                 time.sleep(2 ** attempt)
             else:
+                if isinstance(e, ConnectionError):
+                    raise
                 print(f"  [Refine] LLM call failed after {max_retries} attempts: {e}")
                 return experiences
     

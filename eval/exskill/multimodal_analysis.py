@@ -111,6 +111,8 @@ def _generate_single_image_caption(
             return_placeholder_on_error=True
         )
     except Exception as e:
+        if isinstance(e, ConnectionError):
+            raise
         return f"[Error generating caption: {str(e)}]"
 
 
@@ -285,6 +287,10 @@ def generate_image_captions(
                     caption_key, caption = future.result()
                     captions[caption_key] = caption
                 except Exception as e:
+                    if isinstance(e, ConnectionError):
+                        for pending in future_to_key:
+                            pending.cancel()
+                        raise
                     caption_key = future_to_key[future]
                     print(f"  Warning: Failed to generate caption for {caption_key}: {e}")
                     captions[caption_key] = f"[Error generating caption: {str(e)}]"

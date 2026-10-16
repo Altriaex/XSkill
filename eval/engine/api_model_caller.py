@@ -190,7 +190,7 @@ def create_model_caller(args, sampling_params, save_dir=None):
                     reasoning_text = response_text.strip()
                     print(f"[Reasoning] Using content field as reasoning_text: {len(reasoning_text)} chars")
             
-            is_tool_call_response = isinstance(response, dict) and "tool_calls" in response
+            is_tool_call_response = isinstance(response, dict) and bool(response.get("tool_calls"))
             tool_calls_list = response.get("tool_calls", []) if is_tool_call_response else []
             
             # Update the node with the response
@@ -223,7 +223,7 @@ def create_model_caller(args, sampling_params, save_dir=None):
             
             # Save trajectory step if save_dir is provided
             if save_dir:
-                if isinstance(response, dict) and "tool_calls" in response:
+                if isinstance(response, dict) and bool(response.get("tool_calls")):
                     tool_calls = response.get("tool_calls", [])
                     tool_names = []
                     if tool_calls:
@@ -253,6 +253,10 @@ def create_model_caller(args, sampling_params, save_dir=None):
                     "text_output": display_text,
                     "node_id": getattr(node, 'node_id', ''),
                 }
+                if isinstance(response, dict):
+                    assistant_turn_for_traj["finish_reason"] = response.get("finish_reason")
+                    assistant_turn_for_traj["usage"] = response.get("usage")
+                    assistant_turn_for_traj["content"] = response_text
                 save_trajectory(save_dir,assistant_turn_for_traj)
             
             # Parse response using new function call parser
@@ -294,9 +298,12 @@ def create_model_caller(args, sampling_params, save_dir=None):
             return response_text
             
         except Exception as e:
+            if isinstance(e, ConnectionError):
+                raise
             import traceback
             print(f"Error in model caller: {e}")
             traceback.print_exc()
             return None
     
+    model_caller.close = tool_handler.close
     return model_caller

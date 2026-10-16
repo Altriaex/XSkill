@@ -100,7 +100,7 @@ class ExperienceLLM:
                 
                 if resp.status_code == 200:
                     data = resp.json()
-                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                    content = (data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
                     if content:
                         return content
                     else:
@@ -132,13 +132,11 @@ class ExperienceLLM:
                         return f"[Failed to generate: {resp.status_code}]"
                     raise RuntimeError(error_msg)
                     
-            except requests.exceptions.Timeout:
-                error_msg = f"[{api_name}] API timeout on attempt {attempt + 1}/{max_retries}"
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                error_msg = f"[{api_name}] LLM network error on attempt {attempt + 1}/{max_retries}: {e}"
                 print(error_msg)
                 if attempt == max_retries - 1:
-                    if return_placeholder_on_error:
-                        return f"[Failed to generate: timeout]"
-                    raise RuntimeError(f"[{api_name}] API timeout after {max_retries} attempts")
+                    raise ConnectionError(f"{api_name}: LLM network retries exhausted") from e
                 time.sleep(base_wait_time)
             except requests.exceptions.RequestException as e:
                 error_msg = f"[{api_name}] API call failed on attempt {attempt + 1}/{max_retries}: {e}"
@@ -269,7 +267,7 @@ class ExperienceLLM:
                 timeout=timeout,
                 return_placeholder_on_error=return_placeholder_on_error
             )
-        except RuntimeError as e:
+        except (RuntimeError, ConnectionError) as e:
             # Primary API failed, try fallback if configured
             if api_key_2 and end_point_2:
                 end_point_2 = self._normalize_endpoint(end_point_2, require_chat_completions)
@@ -283,11 +281,15 @@ class ExperienceLLM:
                         timeout=timeout,
                         return_placeholder_on_error=return_placeholder_on_error
                     )
-                except RuntimeError as e2:
+                except (RuntimeError, ConnectionError) as e2:
+                    if isinstance(e, ConnectionError) and isinstance(e2, ConnectionError):
+                        raise
                     if return_placeholder_on_error:
                         return f"[Failed: both APIs failed]"
                     raise RuntimeError(f"Both {primary_api_name} and {fallback_api_name} failed. Primary: {e}. Fallback: {e2}")
             else:
+                if isinstance(e, ConnectionError):
+                    raise
                 if return_placeholder_on_error:
                     return f"[Failed: {str(e)}]"
                 raise RuntimeError(f"{primary_api_name} failed and no fallback configured: {e}")

@@ -685,6 +685,8 @@ class ExperienceRetriever:
                     logger.warning(f"LLM decomposition failed (attempt {attempt + 1}/{MAX_RETRIES}): {e}, retrying...")
                     time.sleep(2 ** attempt)  # Exponential backoff
                 else:
+                    if isinstance(e, ConnectionError):
+                        raise
                     logger.warning(f"LLM decomposition failed after {MAX_RETRIES} attempts: {e}, falling back to single query")
         
         # Fallback: return a single general query
@@ -887,6 +889,8 @@ def rewrite_experiences_for_task(
             logger.warning("Could not extract JSON from rewrite response, using original experiences")
     
     except Exception as e:
+        if isinstance(e, ConnectionError):
+            raise
         logger.warning(f"Failed to rewrite experiences: {e}", exc_info=True)
         print(f"  [Rewrite] Warning: Failed to rewrite experiences: {e}, using original experiences")
     

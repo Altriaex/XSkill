@@ -57,6 +57,12 @@ class APIToolHandler:
             'web_search': web_search_max_calls,
         }
     
+    def close(self):
+        """Release the CodeInterpreter owned by this rollout."""
+        tool = self.tool_instances.pop("code_interpreter", None)
+        if tool is not None:
+            tool.close()
+
     def _determine_image_name(self, tool_name, image_ref, alt_text, node):
         """
         Unify image naming for all tools.

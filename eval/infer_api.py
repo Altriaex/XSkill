@@ -221,6 +221,8 @@ def generate_experience_for_sample(sample_info, args):
         result['experience_ops'] = norm_ops
         
     except Exception as e:
+        if isinstance(e, ConnectionError):
+            raise
         result['error'] = str(e)
         import traceback
         result['traceback'] = traceback.format_exc()
@@ -356,6 +358,10 @@ def process_large_batch_experiences(samples_info, args, batch_idx=0, is_final=Fa
                     })
                     print(f"  Warning: Generation failed for {result['sample_id']}: {result.get('error', 'Unknown error')}")
             except Exception as e:
+                if isinstance(e, ConnectionError):
+                    for pending in exp_futures:
+                        pending.cancel()
+                    raise
                 metadata["errors"].append({
                     "stage": "generation", "question_id": sample_info["question_id"],
                     "error": str(e),
@@ -395,6 +401,8 @@ def process_large_batch_experiences(samples_info, args, batch_idx=0, is_final=Fa
                 print(f"  [Large Batch] Merged {len(all_experience_ops)} experience operations into library (final size: {len(merged)})")
                 print(f"  [Timing] Experience merge: {merge_time:.1f}s")
         except Exception as e:
+            if isinstance(e, ConnectionError):
+                raise
             metadata["errors"].append({"stage": "experience_update", "error": str(e)})
             print(f"  Warning: Failed to merge experiences into library: {e}")
             
@@ -434,6 +442,8 @@ def process_large_batch_experiences(samples_info, args, batch_idx=0, is_final=Fa
                 print(f"  [Large Batch] Merged {len(all_skill_contents)} skills into library")
                 print(f"  [Timing] Skill merge: {merge_time:.1f}s")
         except Exception as e:
+            if isinstance(e, ConnectionError):
+                raise
             metadata["errors"].append({"stage": "skill_update", "error": str(e)})
             print(f"  Warning: Failed to merge skills into library: {e}")
     
@@ -598,14 +608,17 @@ def main(args):
                     executor.submit(run_single_rollout, sample, sample_args, sampling_params, rollout_idx): rollout_idx
                     for rollout_idx in range(sample_args.rollouts_per_sample)
                 }
-                for future in as_completed(future_to_rollout_idx):
-                    rollout_idx = future_to_rollout_idx[future]
-                    result = future.result()
-                    if result:
-                        result['_rollout_idx'] = rollout_idx
-                        sample_rollout_results.append(result)
-            
-        
+                try:
+                    for future in as_completed(future_to_rollout_idx):
+                        rollout_idx = future_to_rollout_idx[future]
+                        result = future.result()
+                        if result:
+                            result['_rollout_idx'] = rollout_idx
+                            sample_rollout_results.append(result)
+                finally:
+                    for future in future_to_rollout_idx:
+                        future.cancel()
+
         else:
             result = process_single_sample(sample, sample_args, sampling_params, rollout_idx=None)
             if result:

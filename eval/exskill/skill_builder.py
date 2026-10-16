@@ -79,6 +79,8 @@ def generate_skill_for_sample(sample_info: Dict[str, Any], llm: Any, args: Any, 
         else:
             result['error'] = "LLM returned empty skill content"
     except Exception as e:
+        if isinstance(e, ConnectionError):
+            raise
         result['error'] = str(e)
         
     return result
@@ -118,6 +120,8 @@ def merge_skills(existing_content: str, new_skill_contents: List[str], llm: Any,
             merged_content = re.sub(r'\n```$', '', merged_content)
             return merged_content.strip()
     except Exception as e:
+        if isinstance(e, ConnectionError):
+            raise
         print(f"  Warning: Error merging skills: {e}")
         
     return existing_content
@@ -167,6 +171,8 @@ def adapt_skill_for_task(base_skill: str, experiences: str, task_description: st
             adapted_content = re.sub(r'^---\s*\n.*?\n---\s*\n', '', adapted_content, flags=re.DOTALL | re.MULTILINE)
             return adapted_content.strip()
     except Exception as e:
+        if isinstance(e, ConnectionError):
+            raise
         print(f"  Warning: Error adapting skill: {e}")
         
     return base_skill
@@ -227,6 +233,8 @@ def refine_skill_document(skill_content: str, llm: Any, skill_path: Optional[str
             
             return refined_content
     except Exception as e:
+        if isinstance(e, ConnectionError):
+            raise
         print(f"  [Skill Refine] Error: {e}")
     
     return skill_content

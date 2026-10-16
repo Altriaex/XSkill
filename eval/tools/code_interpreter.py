@@ -22,6 +22,7 @@ from typing import Dict, Set
 
 from PIL import Image
 from jupyter_client import BlockingKernelClient
+from jupyter_core.utils import ensure_event_loop
 from tools.base import BaseTool
 from tools.tool_registry import register_tool
 
@@ -42,22 +43,46 @@ app.launch_new_instance()
 """
 
 
+def _close_kernel(kc, process):
+    """Release an owned kernel's channels, context and subprocess."""
+    try:
+        if kc is not None:
+            # Access existing channels directly: properties create missing channels.
+            for name in ("_shell_channel", "_iopub_channel", "_stdin_channel",
+                         "_hb_channel", "_control_channel"):
+                channel = getattr(kc, name)
+                if channel is not None:
+                    try:
+                        if channel.is_alive():
+                            channel.stop()
+                        else:
+                            channel.close()
+                    except Exception as exc:
+                        print(f"[CodeInterpreter] Failed to close {name}: {exc}")
+            if kc._created_context:
+                kc.context.destroy(linger=0)
+    finally:
+        if process is not None:
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+
 def _kill_kernels_and_subprocesses(_sig_num=None, _frame=None):
-    """Clean up all kernels and subprocesses."""
+    """Clean up remaining kernels through the normal release path."""
     with _KERNEL_LOCK:
-        for v in list(_KERNEL_CLIENTS.values()):
-            try:
-                v.shutdown()
-            except:
-                pass
+        resources = [
+            (_KERNEL_CLIENTS.get(key), _MISC_SUBPROCESSES.get(key))
+            for key in _KERNEL_CLIENTS.keys() | _MISC_SUBPROCESSES.keys()
+        ]
         _KERNEL_CLIENTS.clear()
-        
-        for v in list(_MISC_SUBPROCESSES.values()):
-            try:
-                v.terminate()
-            except:
-                pass
         _MISC_SUBPROCESSES.clear()
+    for kc, process in resources:
+        _close_kernel(kc, process)
 
 
 # Register cleanup function
@@ -68,10 +93,8 @@ if threading.current_thread() is threading.main_thread():
 def execute_with_timeout(func, timeout, **kwargs):
     """Execute a function with timeout support and graceful interruption.
     
-    Note: Python threads cannot be truly killed, so after timeout:
-    1. Set stop_event to notify the function to exit
-    2. Use wait=False to avoid blocking
-    3. Caller must ensure kernel process is forcefully terminated
+    The worker observes stop_event between bounded I/O waits. Join it before
+    returning so rollout cleanup cannot close sockets still used by the worker.
     """
     import time as time_module
     import threading
@@ -81,10 +104,18 @@ def execute_with_timeout(func, timeout, **kwargs):
     stop_event = threading.Event()
     kwargs['_stop_event'] = stop_event
     
-    # Don't use with statement to avoid waiting for task completion on exit
+    def execute_and_close_loop():
+        # This worker owns its Jupyter event loop for exactly one execution.
+        loop = ensure_event_loop()
+        try:
+            return func(**kwargs)
+        finally:
+            loop.close()
+            asyncio.set_event_loop(None)
+
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        future = executor.submit(func, **kwargs)
+        future = executor.submit(execute_and_close_loop)
         try:
             result = future.result(timeout=timeout)
             elapsed = time_module.time() - start_time
@@ -105,9 +136,8 @@ def execute_with_timeout(func, timeout, **kwargs):
             print(f"[CodeInterpreter] execute_with_timeout exception after {elapsed:.2f}s: {e}")
             return f'Fatal Error: {e}'
     finally:
-        # Use wait=False to return immediately, don't wait for timed-out tasks to complete
-        # Timed-out tasks will continue running in the background until completed or terminated by kernel
-        executor.shutdown(wait=False)
+        # Finish interrupt cleanup before the rollout releases its channels.
+        executor.shutdown(wait=True)
 
 
 @register_tool('code_interpreter')
@@ -160,6 +190,7 @@ Pre-installed packages:
     }
     
     def __init__(self, config=None):
+        self._kernel_ids = set()
         super().__init__(config)
         # Instance ID (generated before setting work directory)
         self.instance_id = str(uuid.uuid4())
@@ -405,15 +436,12 @@ Pre-installed packages:
                         _KERNEL_CLIENTS[kernel_id] = new_kc
                         _MISC_SUBPROCESSES[kernel_id] = new_subproc
                         kc = new_kc
+                        self._kernel_ids.add(kernel_id)
                     else:
                         # Another thread has already created, use existing one
                         kc = _KERNEL_CLIENTS[kernel_id]
                         # Close recently created kernel (to avoid resource leak)
-                        try:
-                            new_kc.shutdown()
-                            new_subproc.terminate()
-                        except Exception:
-                            pass
+                        _close_kernel(new_kc, new_subproc)
             
             # Execute code
             full_code += '\n\n'  # Ensure code ends with a newline
@@ -477,72 +505,30 @@ Pre-installed packages:
             print(f"[CodeInterpreter] ERROR - Failed to start kernel process: {e}")
             raise
         
-        # Wait for connection file creation
-        max_wait = KERNEL_INIT_MAX_WAIT
-        wait_time = 0
-        while not os.path.isfile(connection_file) and wait_time < max_wait:
-            time.sleep(KERNEL_INIT_POLL_INTERVAL)
-            wait_time += KERNEL_INIT_POLL_INTERVAL
-        
-        if not os.path.isfile(connection_file):
-            error_msg = f"Kernel connection file not created after {max_wait}s"
-            print(f"[CodeInterpreter] ERROR - {error_msg}")
-            try:
-                kernel_process.terminate()
-            except:
-                pass
-            raise RuntimeError(error_msg)
-        
-        # Wait for file to be readable
-        while wait_time < max_wait:
-            try:
-                with open(connection_file, 'r') as fp:
-                    json.load(fp)
-                break
-            except (json.JSONDecodeError, IOError) as e:
-                time.sleep(KERNEL_INIT_POLL_INTERVAL)
-                wait_time += KERNEL_INIT_POLL_INTERVAL
-                if wait_time >= max_wait:
-                    error_msg = f"Connection file not readable after {max_wait}s: {e}"
-                    print(f"[CodeInterpreter] ERROR - {error_msg}")
-                    try:
-                        kernel_process.terminate()
-                    except:
-                        pass
-                    raise RuntimeError(error_msg)
-        
-        # Create client
+        kc = None
         try:
+            # Wait for a complete connection file before creating channels.
+            deadline = time.monotonic() + KERNEL_INIT_MAX_WAIT
+            while True:
+                try:
+                    with open(connection_file) as fp:
+                        json.load(fp)
+                    break
+                except (FileNotFoundError, json.JSONDecodeError):
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("Kernel connection file not ready after 10s")
+                    time.sleep(KERNEL_INIT_POLL_INTERVAL)
+
             kc = BlockingKernelClient(connection_file=connection_file)
-        except Exception as e:
-            print(f"[CodeInterpreter] ERROR - Failed to create BlockingKernelClient: {e}")
-            try:
-                kernel_process.terminate()
-            except:
-                pass
-            raise
-        
-        # Set event loop policy (for compatibility)
-        try:
-            asyncio.set_event_loop_policy(AnyThreadEventLoopPolicy())
-        except Exception:
-            pass  # Ignore event loop policy setup failure
-        
-        try:
             kc.load_connection_file()
             kc.start_channels()
-            kc.wait_for_ready()
-        except Exception as e:
-            print(f"[CodeInterpreter] ERROR - Failed to initialize kernel client: {e}")
-            import traceback
-            traceback.print_exc()
-            try:
-                kc.shutdown()
-                kernel_process.terminate()
-            except:
-                pass
+            # Own the readiness loop so short-lived rollout threads do not leak it.
+            with asyncio.Runner() as runner:
+                runner.run(kc._async_wait_for_ready(timeout=60))
+        except Exception:
+            _close_kernel(kc, kernel_process)
             raise
-        
+
         return kc, kernel_process
     
     def _is_valid_output(self, msg_type: str, msg: dict) -> bool:
@@ -638,22 +624,13 @@ Pre-installed packages:
             except Exception as e:
                 print(f"[CodeInterpreter] Failed to terminate kernel process: {e}")
         
-        # Method 3: Clean kernel references in global dictionary (ensure kernel is recreated on next call)
-        try:
-            with _KERNEL_LOCK:
-                if kernel_id in _KERNEL_CLIENTS:
-                    try:
-                        _KERNEL_CLIENTS[kernel_id].shutdown()
-                    except:
-                        pass
-                    del _KERNEL_CLIENTS[kernel_id]
-                    print(f"[CodeInterpreter] Kernel client removed from cache")
-                if kernel_id in _MISC_SUBPROCESSES:
-                    del _MISC_SUBPROCESSES[kernel_id]
-                    print(f"[CodeInterpreter] Kernel process removed from cache")
-        except Exception as e:
-            print(f"[CodeInterpreter] Failed to cleanup kernel references: {e}")
-    
+        # Release channels and reap the interrupted process.
+        with _KERNEL_LOCK:
+            client = _KERNEL_CLIENTS.pop(kernel_id, None)
+            process = _MISC_SUBPROCESSES.pop(kernel_id, None)
+            self._kernel_ids.discard(kernel_id)
+        _close_kernel(client, process)
+
     def _execute_code(self, kc, code: str, existing_image_files=None, _stop_event=None, kernel_id=None, tool_image_start_count=0) -> str:
         """Execute code and get results (simplified version, using signal mechanism for timeout).
         
@@ -858,27 +835,21 @@ Pre-installed packages:
         
         return local_image_file
     
+    def close(self):
+        """Release all kernels created by this instance, regardless of thread."""
+        with _KERNEL_LOCK:
+            resources = [
+                (_KERNEL_CLIENTS.pop(key, None), _MISC_SUBPROCESSES.pop(key, None))
+                for key in self._kernel_ids
+            ]
+            self._kernel_ids.clear()
+        for kc, process in resources:
+            _close_kernel(kc, process)
+
     def __del__(self):
-        """Clean up resources."""
-        # Clean up kernel for this instance in current thread
         try:
-            kernel_id = self._get_kernel_id()
-            
-            with _KERNEL_LOCK:
-                if kernel_id in _KERNEL_CLIENTS:
-                    try:
-                        _KERNEL_CLIENTS[kernel_id].shutdown()
-                    except:
-                        pass
-                    del _KERNEL_CLIENTS[kernel_id]
-                if kernel_id in _MISC_SUBPROCESSES:
-                    try:
-                        _MISC_SUBPROCESSES[kernel_id].terminate()
-                    except:
-                        pass
-                    del _MISC_SUBPROCESSES[kernel_id]
-        except:
-            # Ignore all errors to avoid exceptions during destruction
+            self.close()
+        except Exception:
             pass
 
 
@@ -886,23 +857,4 @@ def _escape_ansi(line: str) -> str:
     """Remove ANSI escape sequences"""
     ansi_escape = re.compile(r'(?:\x1B[@-_]|[\x80-\x9F])[0-?]*[ -/]*[@-~]')
     return ansi_escape.sub('', line)
-
-
-# Event loop policy (for compatibility)
-if sys.platform == 'win32' and hasattr(asyncio, 'WindowsSelectorEventLoopPolicy'):
-    _BasePolicy = asyncio.WindowsSelectorEventLoopPolicy
-else:
-    _BasePolicy = asyncio.DefaultEventLoopPolicy
-
-
-class AnyThreadEventLoopPolicy(_BasePolicy):
-    """Event loop policy that allows creating event loops in any thread."""
-    
-    def get_event_loop(self) -> asyncio.AbstractEventLoop:
-        try:
-            return super().get_event_loop()
-        except RuntimeError:
-            loop = self.new_event_loop()
-            self.set_event_loop(loop)
-            return loop
 

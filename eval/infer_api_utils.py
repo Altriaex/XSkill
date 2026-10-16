@@ -213,6 +213,8 @@ def retrieve_experiences_for_sample(sample, args, experience_retriever, base_sys
         return _finalize_prompt(args, dynamic_system_prompt, update_global_prompts)
         
     except Exception as e:
+        if isinstance(e, ConnectionError):
+            raise
         logger.warning(f"Failed to process for {question_id}: {e}", exc_info=True)
         print(f"  [Pipeline] Warning: {e}")
         return _finalize_prompt(args, base_system_prompt, update_global_prompts)
@@ -253,6 +255,8 @@ def _process_skill(args, query_text, retrieved_exps, images, llm_client, sample_
         
         return SKILL_INJECTION_HEADER.format(skill_content=skill_content)
     except Exception as e:
+        if isinstance(e, ConnectionError):
+            raise
         print(f"  [Skill] Warning: {e}")
         return ""
 
@@ -818,6 +822,10 @@ def execute_pipeline_parallel_processing(
                         future.result()  # Ensure retrieval finished successfully
                         print(f"  [Pipeline] Sample {question_id}: Retrieve completed, submitting {args.rollouts_per_sample} rollouts...")
                     except Exception as e:
+                        if isinstance(e, ConnectionError):
+                            for pending in active_futures:
+                                pending.cancel()
+                            raise
                         print(f"  [Pipeline] Error retrieving for sample {question_id}: {e}. Falling back to base prompt.")
                         sample_args._sample_system_prompt = base_system_prompt
                     
@@ -858,6 +866,10 @@ def execute_pipeline_parallel_processing(
                             if all_results_list is not None:
                                 all_results_list.append(result)
                     except Exception as e:
+                        if isinstance(e, ConnectionError):
+                            for pending in active_futures:
+                                pending.cancel()
+                            raise
                         print(f"  [Pipeline] Error in rollout {rollout_idx} for sample {actual_sample_idx}: {e}")
                     
                     # Update progress

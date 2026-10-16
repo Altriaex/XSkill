@@ -97,16 +97,16 @@ def _make_api_request(end_point: str, headers: dict, payload: dict, api_name: st
     Returns:
         tuple: (response, error_type) 
                response: requests.Response object or None
-               error_type: "429", "timeout", "network", "other", None(Success)
+               error_type: network exception, "429", "network", "other", or None (success)
     """
     try:
         response = requests.post(end_point, headers=headers, json=payload, timeout=API_TIMEOUT)
         if response.status_code == 429:
             return response, "429"
         return response, None
-    except requests.exceptions.Timeout:
-        print(f"[{api_name}] API timeout")
-        return None, "timeout"
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+        print(f"[{api_name}] LLM network request failed: {e}")
+        return None, e
     except requests.exceptions.RequestException as e:
         print(f"[{api_name}] API call failed: {e}")
         return None, "network"
@@ -173,26 +173,11 @@ def _parse_api_response(response, api_name: str, attempt: int = 0, max_attempts:
             print(f"[{api_name}] API returned invalid message type{attempt_str}: {type(message)}")
             return None, False, "invalid_format"
         
-        # Check for function call (tool_calls field)
-        if "tool_calls" in message and message["tool_calls"]:
-            return message, False, None
-        
-        # Check for content (text response)
-        content = message.get("content")
-        if content and content.strip():
-            # Return full message if there's reasoning_details to preserve
-            if "reasoning_details" in message or "reasoning" in message:
-                return message, False, None
-            return content, False, None
-        else:
-            attempt_str = f" on attempt {attempt + 1}/{max_attempts}" if max_attempts > 1 else ""
-            print(f"[{api_name}] API returned empty content{attempt_str}")
-            if max_attempts > 1:
-                try:
-                    print(f"[{api_name}] Empty message detail: {json.dumps(message, ensure_ascii=False)}")
-                except Exception:
-                    print(f"[{api_name}] Empty message detail: {message}")
-            return None, False, "empty_content"
+        # Successful empty content remains a task outcome, never a network failure.
+        message = dict(message)
+        message["finish_reason"] = first_choice.get("finish_reason")
+        message["usage"] = result.get("usage")
+        return message, False, None
     else:
         # Handle empty choices array (model refused to generate)
         if "choices" in result and len(result["choices"]) == 0:
@@ -264,6 +249,8 @@ def _try_single_attempt(api_key: str, end_point: str, model_name: str, messages:
     if request_error:
         error_msg = f"{api_name}: {request_error}"
         print(f"[{api_name}] Request failed: {request_error}")
+        if isinstance(request_error, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+            return (None, False, request_error)
         return (None, False, error_msg)
     
     # Parse response
@@ -321,6 +308,8 @@ def _try_single_api(api_key: str, end_point: str, model_name: str, messages: lis
             if attempt < max_retries - 1:
                 time.sleep(BASE_WAIT_TIME)
                 continue
+            if isinstance(request_error, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+                raise ConnectionError(f"{api_name}: LLM network retries exhausted") from request_error
             return None
         
         # Handle 429 error: exponential backoff and retry
@@ -433,6 +422,11 @@ def call_vision_api(model_name: str, messages: list, sampling_params: dict, max_
         if all_errors:
             error_summary += f". Errors: {'; '.join(all_errors)}"
         print(f"[API Round-Robin] {error_summary}")
+        if (
+            isinstance(error_1, (requests.exceptions.Timeout, requests.exceptions.ConnectionError))
+            and isinstance(error_2, (requests.exceptions.Timeout, requests.exceptions.ConnectionError))
+        ):
+            raise ConnectionError("Both LLM endpoints exhausted network retries") from error_2
         return f"Error: {error_summary}"
     else:
         # No fallback API, use original retry logic with primary API only

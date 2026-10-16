@@ -303,6 +303,8 @@ def _run_greedy_loop(current_node, model_caller, args, sampling_params, question
         try:
             response_text = model_caller(current_node)
         except Exception as e:
+            if isinstance(e, ConnectionError):
+                raise
             print(f"Error calling model at turn {turn}: {e}")
             import traceback
             traceback.print_exc()
@@ -409,25 +411,28 @@ def _process_single_sample_unified(sample, args, sampling_params):
     # Create model caller
     model_caller = create_model_caller(args, sampling_params, save_dir)
     
-    # Run greedy inference loop
-    final_node = _run_greedy_loop(
-        initial_node, model_caller, args, sampling_params, question_text, save_dir
-    )
-    final_answer = final_node.final_answer
-    
-    # Extract responses and evaluate
-    conversation_history, assistant_responses = _extract_responses_from_node(final_node)
-    accuracy_score, trajectory_score, trajectory_analysis, trajectory_text = _evaluate_trajectory(
-        question_text, ground_truth, conversation_history, assistant_responses, question_id
-    )
-    
-    # Build result dict
-    result = _build_result_dict(
-        question_id, question_text, final_answer, ground_truth, conversation_history,
-        accuracy_score, trajectory_text, trajectory_score, trajectory_analysis
-    )
-    
-    return result
+    try:
+        # Run greedy inference loop
+        final_node = _run_greedy_loop(
+            initial_node, model_caller, args, sampling_params, question_text, save_dir
+        )
+        final_answer = final_node.final_answer
+
+        # Extract responses and evaluate
+        conversation_history, assistant_responses = _extract_responses_from_node(final_node)
+        accuracy_score, trajectory_score, trajectory_analysis, trajectory_text = _evaluate_trajectory(
+            question_text, ground_truth, conversation_history, assistant_responses, question_id
+        )
+
+        # Build result dict
+        result = _build_result_dict(
+            question_id, question_text, final_answer, ground_truth, conversation_history,
+            accuracy_score, trajectory_text, trajectory_score, trajectory_analysis
+        )
+
+        return result
+    finally:
+        model_caller.close()
 
 
 # ============================================================================
