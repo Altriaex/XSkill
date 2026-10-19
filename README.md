@@ -214,6 +214,47 @@ bash eval/run_exskill_inference.sh
 
 
 
+## Regrading saved results
+
+`eval/rejudge.py` appends a named evaluation under `reevaluations` in the existing metrics files. Original scores, explanations, `result`, and other evaluations retain their values. It does not create a separate score directory or copy old scores into the new evaluation. Saved trajectories, images, and knowledge are unchanged.
+
+The script uses the saved assistant responses, question, ground truth, original answer extraction rules, judge prompts, and scoring parameters. It does not use `final_answer` as a substitute for the original extraction logic.
+
+Set `VERIFIER_MODEL_NAME`, `VERIFIER_END_POINT` (the `/v1` base URL), and `VERIFIER_API_KEY` in the regrading process. The following **Bash** example keeps the key out of shell history and the project's `.env`. Each input must be a completed experiment with its dataset summary and all rollout records.
+
+```bash
+cd /home/guoxi/Projects/evolving_si/XSkill
+(
+  export VERIFIER_MODEL_NAME=gpt-6.1-sol
+  export VERIFIER_END_POINT=https://litellm.mybigai.ac.cn/v1
+  read -r -s -p 'Judge API key: ' VERIFIER_API_KEY
+  echo
+  export VERIFIER_API_KEY
+
+  uv run --no-sync python eval/rejudge.py \
+    --input-dir output/agentvista_xskill_test \
+    --evaluation-name gpt-6.1-sol \
+    --num-workers 4
+
+  uv run --no-sync python eval/rejudge.py \
+    --input-dir output/agentvista_tool_only_test \
+    --evaluation-name gpt-6.1-sol \
+    --num-workers 4
+)
+```
+
+`--evaluation-name` is the key under `reevaluations`, independent of the actual model selected by the environment. Reusing a name resumes that evaluation; a different name, such as `gpt-6.1-sol-repeat`, starts an independent evaluation. A name cannot be reused with different model, endpoint, or sample settings. There is no `--output-dir` option.
+
+The script appends entries to these existing files:
+
+- `<question_id>/rollout_<index>/metrics.json`: `reevaluations[name]` stores only the new score, explanation, extracted answer, status, identity, and timestamp.
+- `<question_id>/metrics_sample.json`: `reevaluations[name]` stores per-question scores and metrics.
+- `metrics_at_k.json`: `reevaluations[name]` stores dataset metrics, completion counts, extraction failures, evaluation errors, and `settings` describing the judge model, endpoint, and scoring parameters. No API key is saved.
+
+Successful scores are skipped on resume; evaluation errors are retried. The original rule that answer extraction failure receives zero without an API call is preserved. API errors or invalid judge responses receive `accuracy_score: null` and `status: evaluation_error`, not an incorrect-answer score. The named dataset `k_metrics` remain null until every rollout has a valid score. The script exits with status 1 if scoring errors remain, or 0 after completion. Average@k and Pass@k use the same first-k rollout calculation and four-decimal rounding as the inference entry point.
+
+Run only one regrading process per experiment directory, and do not run inference or extend that experiment concurrently: the inference writer does not preserve these added fields when it rewrites metrics. Files are replaced atomically, but their JSON formatting may change; preservation refers to the values of original fields. An interrupted run can leave a stale named summary; rerunning the same command rebuilds it from saved per-rollout scores.
+
 ## Citation
 
 If you use XSkill in your research, please cite:

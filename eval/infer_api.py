@@ -6,6 +6,7 @@ import json
 import threading
 import tempfile
 import shutil
+import socket
 import time
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -44,6 +45,16 @@ from infer_api_utils import (
     compute_dataset_summary,
     execute_pipeline_parallel_processing,
 )
+
+
+_original_getaddrinfo = socket.getaddrinfo
+
+
+def resolve_with_jina_override(host, port, *args, **kwargs):
+    """Resolve Jina Reader through the verified address; preserve other hosts."""
+    if host == "r.jina.ai":
+        host = "104.26.11.242"
+    return _original_getaddrinfo(host, port, *args, **kwargs)
 
 
 def run_single_rollout(sample, args, sampling_params, rollout_idx):
@@ -745,6 +756,8 @@ def main(args):
 
 
 if __name__ == "__main__":
+    # Apply the Jina route to all requests made by this experiment.
+    socket.getaddrinfo = resolve_with_jina_override
     parser = argparse.ArgumentParser(description="API-based inference script.")
     parser.add_argument("--input-file", type=str, required=True, help="Path to the input data file.")
     parser.add_argument("--image-folder", type=str, required=True, help="Path to the folder containing images.")
